@@ -21,6 +21,7 @@ from .config import Defaults, REF_LAT, REF_LON
 from .dem import fetch_dem
 from .detect import detect_dunes
 from .geology import load_dunes, load_sand, fetch_geology, parse_features
+from .osm_search import run_osm_search, select_diverse as select_diverse_osm
 from .slope import compute_slope, hillshade
 from .viz import quicklook
 from .wide import run_wide_search, select_diverse
@@ -50,6 +51,13 @@ def main(argv: list[str] | None = None) -> int:
                         "default uses any sand-dominant surface (Düne, Talsand, "
                         "Schmelzwassersand) — many real dunes sit on top of Sander "
                         "and are not separately delineated at 1:25k.")
+    p.add_argument("--mask", choices=("geology", "osm"), default="geology",
+                   help="In wide-AOI mode, choose the surface mask: 'geology' "
+                        "(GK25 sand-dominant lithology — covers forested dunes) "
+                        "or 'osm' (OSM natural=sand|dune polygons — visibly bare "
+                        "sand at the surface).")
+    p.add_argument("--osm-min-area", type=float, default=5_000.0,
+                   help="OSM polygon area threshold (m²) — drops sandpits etc.")
     p.add_argument("--workers", type=int, default=4,
                    help="concurrent tile workers (wide-AOI mode)")
     p.add_argument("--out", type=Path, default=Path("out"))
@@ -127,8 +135,11 @@ def _run_wide(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     cx, cy = to_25833(args.lon, args.lat)
     print(f"Wide-AOI search: centre ({args.lat:.4f}, {args.lon:.4f}) "
-          f"= ({cx:.0f}, {cy:.0f}) EPSG:25833, radius {args.radius} m")
+          f"= ({cx:.0f}, {cy:.0f}) EPSG:25833, radius {args.radius} m, mask={args.mask}")
     sf = args.scale_factor if args.scale_factor < 0.2 else 0.1
+
+    if args.mask == "osm":
+        return _run_osm(args, cx, cy, sf)
 
     cand = run_wide_search(
         args.lon, args.lat, args.radius, work_dir=out / "tiles",
@@ -162,6 +173,41 @@ def _run_wide(args) -> int:
                f"@{lat:.6f},{lon:.6f},400m/data=!3m1!1e3")
         print(f"{i:>2}  {r.area_m2:>9.0f}  {r.mean_slope_deg:>5.1f}  "
               f"{r.max_slope_deg:>5.1f}  {lat:>9.5f}  {lon:>9.5f}  {url}")
+    return 0
+
+
+def _run_osm(args, cx: float, cy: float, sf: float) -> int:
+    out = args.out
+    cand = run_osm_search(
+        args.lon, args.lat, args.radius, work_dir=out / "osm",
+        min_polygon_area_m2=args.osm_min_area,
+        scale_factor=sf, workers=args.workers,
+    )
+    cand_path = out / "osm_candidates.gpkg"
+    if not cand.empty:
+        cand.to_file(cand_path, driver="GPKG")
+    print(f"\n{len(cand)} OSM sand polygons with slope stats → {cand_path}")
+    if cand.empty:
+        return 0
+
+    top = select_diverse_osm(cand, min_spacing_m=args.min_spacing, top=args.top)
+    top.to_file(out / "osm_top.gpkg", driver="GPKG")
+
+    from pyproj import Transformer
+    t = Transformer.from_crs(25833, 4326, always_xy=True)
+    print(f"\nTop {len(top)} OSM bare-sand surfaces (≥ {args.min_spacing} m apart),"
+          " ranked by sqrt(area)·p90(slope):")
+    print(f"{'#':>2}  {'area_m²':>9}  {'p90°':>5}  {'max°':>5}  "
+          f"{'reli.':>5}  {'name':<20}  {'lat':>9}  {'lon':>9}  link")
+    for i, r in enumerate(top.itertuples(), 1):
+        c = r.geometry.centroid
+        lon, lat = t.transform(c.x, c.y)
+        url = (f"https://www.google.com/maps/place/{lat:.6f},{lon:.6f}/"
+               f"@{lat:.6f},{lon:.6f},400m/data=!3m1!1e3")
+        name = (getattr(r, "name", "") or "")[:20]
+        print(f"{i:>2}  {r.area_m2:>9.0f}  {r.p90_slope_deg:>5.1f}  "
+              f"{r.max_slope_deg:>5.1f}  {r.relief_m:>5.1f}  {name:<20}  "
+              f"{lat:>9.5f}  {lon:>9.5f}  {url}")
     return 0
 
 
