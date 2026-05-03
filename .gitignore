@@ -8,4 +8,5 @@ __pycache__/
 
 # Generated run artefacts
 /out/
+/out_*/
 /data/
